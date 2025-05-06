@@ -1,145 +1,145 @@
 import requests
 from qdrant_client import QdrantClient
-from qdrant_client.http.models import PointStruct, VectorParams, Distance
-import uuid
-import json
-import numpy as np
+from qdrant_client.http.models import Distance
+import time
+from typing import Optional, List
+
+# Configuration
+OLLAMA_API_BASE = "http://192.168.0.58:11434"
+EMBED_MODEL = "nomic-embed-text:latest"
+TEXT_MODEL = "mistral-small3.1:latest"
+COLLECTION_NAME = "chateau-azay-le-ferron"
+LOCAL_QDRANT_HOST = "localhost"
+LOCAL_QDRANT_PORT = 6333
+MAX_RETRIES = 3
+RETRY_DELAY = 2
 
 # Initialize Qdrant client
-qdrant_client = QdrantClient(host="localhost", port=6333)
+def connect_to_local_qdrant() -> Optional[QdrantClient]:
+    print(f"Connecting to Qdrant at {LOCAL_QDRANT_HOST}:{LOCAL_QDRANT_PORT}")
+    for attempt in range(MAX_RETRIES):
+        try:
+            client = QdrantClient(host=LOCAL_QDRANT_HOST, port=LOCAL_QDRANT_PORT)
+            if client.collection_exists(COLLECTION_NAME):
+                print(f"Collection '{COLLECTION_NAME}' found")
+                return client
+            print(f"Collection '{COLLECTION_NAME}' does not exist")
+            return None
+        except Exception as e:
+            print(f"Connection attempt {attempt+1} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                print(f"ERROR: Cannot connect to Qdrant at {LOCAL_QDRANT_HOST}:{LOCAL_QDRANT_PORT}")
+                return None
+    return None
 
-# Mistral API endpoint (Ollama-based)
-MISTRAL_ENDPOINT = "http://192.168.0.58:11434"
+# Generate embedding
+def generate_ollama_embedding(text: str) -> List[float]:
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                f"{OLLAMA_API_BASE}/api/embeddings",
+                json={"model": EMBED_MODEL, "prompt": text},
+                timeout=30
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result.get("embedding", [0.0] * 768)
+        except requests.exceptions.RequestException as e:
+            print(f"Embedding attempt {attempt+1} failed: {e}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                print("Max retries reached for embedding")
+                return [0.0] * 768
+    return [0.0] * 768
 
-# Collection name in Qdrant
-COLLECTION_NAME = "museum_info"
-
-# Function to create collection if it doesn't exist
-def create_collection():
+# Query museum info
+def query_museum(client: QdrantClient, question: str) -> str:
+    question_embedding = generate_ollama_embedding(question)
+    
     try:
-        qdrant_client.get_collection(COLLECTION_NAME)
-    except:
-        qdrant_client.create_collection(
+        search_result = client.query_points(
             collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=768, distance=Distance.COSINE)
-        )
+            query=question_embedding,
+            limit=3
+        ).points
+    except Exception as e:
+        print(f"Qdrant query failed: {e}")
+        return "Error: Could not retrieve information from Qdrant"
 
-# Function to get embeddings from Mistral
-def get_embedding(text):
-    try:
-        response = requests.post(
-            MISTRAL_ENDPOINT + "/api/embeddings",
-            json={"model": "mistral", "prompt": text},
-            timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
-        if "embedding" not in data:
-            print(f"Error: 'embedding' key not found in response: {data}")
-            # Fallback: Generate a dummy embedding for testing
-            return np.random.rand(768).tolist()
-        return data["embedding"]
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling Mistral API: {e}")
-        print(f"Response text: {response.text if 'response' in locals() else 'No response'}")
-        # Fallback: Generate a dummy embedding for testing
-        return np.random.rand(768).tolist()
+    context = "\n".join(point.payload.get("text", "")[:1000] for point in search_result)
+    if not context:
+        return "No relevant information found"
 
-# Function to store museum info in Qdrant
-def store_museum_info(museum_data):
-    create_collection()
-    points = []
-    for item in museum_data:
-        embedding = get_embedding(json.dumps(item))
-        point = PointStruct(
-            id=str(uuid.uuid4()),
-            vector=embedding,
-            payload=item
-        )
-        points.append(point)
-    qdrant_client.upsert(
-        collection_name=COLLECTION_NAME,
-        points=points
-    )
-
-# Function to query museum info
-def query_museum(question):
-    # Get embedding for the question
-    question_embedding = get_embedding(question)
-    
-    # Search in Qdrant
-    search_result = qdrant_client.search(
-        collection_name=COLLECTION_NAME,
-        query_vector=question_embedding,
-        limit=3
-    )
-    
-    # Prepare context from search results
-    context = ""
-    for point in search_result:
-        context += json.dumps(point.payload) + "\n"
-    
-    # Query Mistral with context
-    prompt = f"""Based on the following information:
+    prompt = f"""Based on:
 {context}
 
-Answer the question: {question}
-Provide a concise and accurate response."""
+Answer: {question}
+Keep it concise and accurate."""
     
-    try:
-        response = requests.post(
-            MISTRAL_ENDPOINT + "/api/generate",
-            json={
-                "model": "mistral",
-                "prompt": prompt,
-                "max_tokens": 200
-            },
-            timeout=10
-        )
-        response.raise_for_status()
-        data = response.json()
-        return data.get("response", "No response from model").strip()
-    except requests.exceptions.RequestException as e:
-        print(f"Error calling Mistral API: {e}")
-        return "Error: Could not get response from Mistral API."
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                f"{OLLAMA_API_BASE}/api/generate",
+                json={
+                    "model": TEXT_MODEL,
+                    "prompt": prompt,
+                    "max_tokens": 150,
+                    "stream": False
+                },
+                timeout=30
+            )
+            response.raise_for_status()
+            data = response.json()
+            return data.get("response", "No response from model").strip()
+        except requests.exceptions.RequestException as e:
+            print(f"Generation attempt {attempt+1} failed: {e}")
+            print(f"Response text: {response.text if 'response' in locals() else 'No response'}")
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(RETRY_DELAY)
+            else:
+                print("Max retries reached for text generation")
+                return "Error: Could not get response from Mistral API"
+    return "Error: Could not get response from Mistral API"
 
-# Example usage
+# Test Ollama connection
+def test_ollama_connection() -> bool:
+    try:
+        response = requests.get(f"{OLLAMA_API_BASE}/api/tags", timeout=10)
+        response.raise_for_status()
+        models = [model["name"] for model in response.json().get("models", [])]
+        print(f"Ollama models: {models}")
+        if EMBED_MODEL not in models or TEXT_MODEL not in models:
+            print(f"Required models ({EMBED_MODEL}, {TEXT_MODEL}) not found")
+            return False
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"Ollama connection failed: {e}")
+        return False
+
+# Main execution
 if __name__ == "__main__":
-    # Sample museum data
-    museum_data = [
-        {
-            "museum": "Louvre Museum",
-            "opening_hours": "9:00 AM - 6:00 PM, closed on Tuesdays",
-            "things_to_see": "Mona Lisa, Venus de Milo, Winged Victory",
-            "location": "75001 Paris, France",
-            "contact": "+33 1 40 20 50 50",
-            "access": "Metro: Palais-Royal Musée du Louvre",
-            "shop": "Gift shop available on-site and online"
-        },
-        {
-            "museum": "Metropolitan Museum of Art",
-            "opening_hours": "10:00 AM - 5:00 PM, closed on Wednesdays",
-            "things_to_see": "Egyptian Art, American Wing, Arms and Armor",
-            "location": "1000 5th Ave, New York, NY 10028, USA",
-            "contact": "+1 212-535-7710",
-            "access": "Subway: 4, 5, embedding
-            "shop": "Multiple gift shops and online store"
-        }
-    ]
-    
-    # Store data in Qdrant
-    store_museum_info(museum_data)
-    
-    # Example questions
+    if not test_ollama_connection():
+        print("Exiting: Ollama connection or models unavailable")
+        exit(1)
+
+    client = connect_to_local_qdrant()
+    if not client:
+        print("Exiting: Qdrant connection or collection unavailable")
+        exit(1)
+
     questions = [
-        "What are the opening hours of the Louvre Museum?",
-        "What can I see at the Metropolitan Museum of Art?",
-        "How do I contact the Louvre Museum?",
-        "Where is the Metropolitan Museum of Art located?"
+        "What are the opening hours of the museum ?",
+        "What can I see in there ?",
+        "How do I contact them ?",
+        "Where is it located?",
+        "How can I access the place ?",
+        "Is there a shop in there ?"
     ]
-    
-    # Get answers
+
     for question in questions:
-        answer = query_museum(question)
+        answer = query_museum(client, question)
         print(f"Q: {question}")
         print(f"A: {answer}\n")

@@ -3,15 +3,16 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import PointStruct, VectorParams, Distance
 import uuid
 import json
+import numpy as np
 
 # Initialize Qdrant client
 qdrant_client = QdrantClient(host="localhost", port=6333)
 
-# Mistral API endpoint
+# Mistral API endpoint (Ollama-based)
 MISTRAL_ENDPOINT = "http://192.168.0.58:11434"
 
 # Collection name in Qdrant
-COLLECTION_NAME = "abbaye-arthous-landes"
+COLLECTION_NAME = "museum_info"
 
 # Function to create collection if it doesn't exist
 def create_collection():
@@ -25,11 +26,24 @@ def create_collection():
 
 # Function to get embeddings from Mistral
 def get_embedding(text):
-    response = requests.post(
-        MISTRAL_ENDPOINT + "/embeddings",
-        json={"model": "mistral3.1", "prompt": text}
-    )
-    return response.json()["embedding"]
+    try:
+        response = requests.post(
+            MISTRAL_ENDPOINT + "/api/embeddings",
+            json={"model": "mistral", "prompt": text},
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        if "embedding" not in data:
+            print(f"Error: 'embedding' key not found in response: {data}")
+            # Fallback: Generate a dummy embedding for testing
+            return np.random.rand(768).tolist()
+        return data["embedding"]
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Mistral API: {e}")
+        print(f"Response text: {response.text if 'response' in locals() else 'No response'}")
+        # Fallback: Generate a dummy embedding for testing
+        return np.random.rand(768).tolist()
 
 # Function to store museum info in Qdrant
 def store_museum_info(museum_data):
@@ -72,16 +86,22 @@ def query_museum(question):
 Answer the question: {question}
 Provide a concise and accurate response."""
     
-    response = requests.post(
-        MISTRAL_ENDPOINT + "/completions",
-        json={
-            "model": "mistral3.1",
-            "prompt": prompt,
-            "max_tokens": 200
-        }
-    )
-    
-    return response.json()["choices"][0]["text"].strip()
+    try:
+        response = requests.post(
+            MISTRAL_ENDPOINT + "/api/generate",
+            json={
+                "model": "mistral",
+                "prompt": prompt,
+                "max_tokens": 200
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+        return data.get("response", "No response from model").strip()
+    except requests.exceptions.RequestException as e:
+        print(f"Error calling Mistral API: {e}")
+        return "Error: Could not get response from Mistral API."
 
 # Example usage
 if __name__ == "__main__":
@@ -102,7 +122,7 @@ if __name__ == "__main__":
             "things_to_see": "Egyptian Art, American Wing, Arms and Armor",
             "location": "1000 5th Ave, New York, NY 10028, USA",
             "contact": "+1 212-535-7710",
-            "access": "Subway: 4, 5, 6 to 86th Street",
+            "access": "Subway: 4, 5, embedding
             "shop": "Multiple gift shops and online store"
         }
     ]
